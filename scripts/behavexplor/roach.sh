@@ -5,7 +5,7 @@ set -euo pipefail
 export CUDA_VISIBLE_DEVICES=2,3 
 
 # ==== Common Config ====
-output_root="results"
+output_root="results_debug"
 run_index=1
 max_sim_time=600.0
 open_vis=true
@@ -23,8 +23,8 @@ scenario_type="open_scenario"
 scenario_seed_path="scenario_datasets/open_scenario/0.9.10.1/${seed_segment}/${seed_id}.json"
 
 # ==== Tester Config ====
-tester_type="random"
-tester_config_path="fuzzer/open_scenario/random/configs/open_scenario.yaml"
+tester_type="behavexplor"
+tester_config_path="fuzzer/open_scenario/behavexplor/configs/open_scenario.yaml"
 
 run_tag="${tester_type}_${agent_name}_${seed_segment}_${seed_id}_run${run_index}"
 

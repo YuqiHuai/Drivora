@@ -106,7 +106,7 @@ class ScenarioManager(object):
             60.0,  # 60 seconds for tick watchdog
         )
         self._watchdog_agent = Watchdog(
-            120.0,  # 60 seconds for initialization watchdog
+            300.0,  # 300 seconds for initialization agent
         )
         
         # carla info
@@ -405,13 +405,22 @@ class ScenarioManager(object):
         wallclock_t0 = GameTime.get_wallclocktime()
         
         # debug info
-        # logger.debug(f"Total vehicle actors: {len(self.world.get_actors().filter('vehicle.*'))}")
-        # logger.debug(f"Total walker actors: {len(self.world.get_actors().filter('walker.*'))}")
-        # logger.debug(f"Total traffic light actors: {len(self.world.get_actors().filter('traffic.traffic_light*'))}")
-        # logger.debug(f"Total traffic sign actors: {len(self.world.get_actors().filter('traffic.traffic_sign*'))}")
-        # logger.debug(f"Total static prop actors: {len(self.world.get_actors().filter('static.prop.*'))}")
-        # logger.debug(f"Total sensor actors: {len(self.world.get_actors().filter('sensor.*'))}")
+        actor_filters = {
+            "Vehicle": "vehicle.*",
+            "Walker": "walker.*",
+            "Traffic Light": "traffic.traffic_light*",
+            "Traffic Sign": "traffic.traffic_sign*",
+            "Static Prop": "static.prop.*",
+            "Sensor": "sensor.*",
+        }
         
+        print()
+        logger.info(f"=== Actor Statistics (Scenario {self.scenario_config.id}) ===") # NOTE: you defined scenario should have id
+        for name, flt in actor_filters.items():
+            count = len(self.world.get_actors().filter(flt))
+            logger.info(f"{name:<15}: {count:>5}")
+        logger.info("========================")
+
         while self._running:
             timestamp = None
             if self.world:
@@ -517,10 +526,10 @@ class ScenarioManager(object):
             # }
             recorder_sensor = {
                 'type': 'sensor.camera.rgb',
-                'x': 0.0, 'y': 0.0, 'z': 20.0,     # 高度适中，清晰看到车和周围路口
+                'x': 0.0, 'y': 0.0, 'z': 20.0,     
                 'roll': 0.0, 'pitch': -90.0, 'yaw': 0.0,
-                'width': 640, 'height': 480,       # 小分辨率，保证快
-                'fov': 90,                         # 适中视野，不会太远
+                'width': 640, 'height': 480,       
+                'fov': 90,                        
                 'id': f'{ego_vehicle_id}_bird' # config id 
             }
             
@@ -639,7 +648,7 @@ class ScenarioManager(object):
         actor_config_mapper = {actor.id: config_id for config_id, actor in config_other_actors.items() if actor is not None}
         
         # get vehicles
-        other_vehicles = self.ctn_operator.get_world().get_actors().filter('*vehicle.*')
+        other_vehicles = self.ctn_operator.get_world().get_actors().filter('vehicle.*')
         for other_vehicle in other_vehicles:            
             if other_vehicle.id in covered_actor_ids:
                 continue
@@ -649,7 +658,7 @@ class ScenarioManager(object):
             covered_actor_ids.append(other_vehicle.id)
             
         # get walkers
-        other_walkers = self.ctn_operator.get_world().get_actors().filter('*walker*')
+        other_walkers = self.ctn_operator.get_world().get_actors().filter('walker*') # filter controller.ai.walker
         for other_walker in other_walkers:
             if other_walker.id in covered_actor_ids:
                 continue
@@ -803,8 +812,7 @@ class ScenarioManager(object):
                     actor.get_control().direction.z
                 ],
                 'speed': actor.get_control().speed,
-                'jump': actor.get_control().jump,
-                'walk_on_spot': actor.get_control().walk_on_spot,
+                'jump': actor.get_control().jump
             }
             
         elif isinstance(actor, carla.TrafficLight):
@@ -833,6 +841,7 @@ class ScenarioManager(object):
             actor_info['green_time'] = actor.get_green_time()
             actor_info['yellow_time'] = actor.get_yellow_time()
             actor_info['red_time'] = actor.get_red_time()
+        
         elif isinstance(actor, carla.TrafficSign) and (not isinstance(actor, carla.TrafficLight)):
             actor_info['category'] = 'traffic_sign'
             actor_info['trigger_volume'] = {

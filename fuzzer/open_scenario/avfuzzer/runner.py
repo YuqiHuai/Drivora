@@ -6,6 +6,7 @@ import random
 import multiprocessing
 
 from loguru import logger
+from typing import Tuple, Optional
 from datetime import datetime
 from omegaconf import DictConfig
 from deap import base, creator, tools
@@ -24,6 +25,9 @@ from .oracle import ScenarioOracle
 
 @FUZZER_REGISTRY.register("fuzzer.open_scenario.avfuzzer")
 class AVFuzzer(Fuzzer):
+    """
+    # TODO: add resampling logics
+    """
     
     def __init__(
         self, 
@@ -51,7 +55,9 @@ class AVFuzzer(Fuzzer):
         ###### The following should be in checkpoint ########
         # 5. pipeline config
         self.population_size = self.pipeline_config.get('population_size', 4)
+        self.tournsize = self.pipeline_config.get('tournsize', 2)
         self.mutation_prob = self.pipeline_config.get('mutation_prob', 0.5)
+        self.crossover_prob = self.pipeline_config.get('crossover_prob', 0.5) # not used
         
         # 6. internal parameters & checkpoint information
         # internal parameters used in fuzzer
@@ -60,6 +66,7 @@ class AVFuzzer(Fuzzer):
         self.F_corpus = [] # save all expected corpus
         self.best_score = float("inf") # min is better
         self.pop = []
+        self.ga_init_seed: Optional[FuzzSeed] = None
         
         self.logbook = tools.Logbook()
         self.logbook.header = ["gen", "fitness", "best_so_far"]
@@ -74,6 +81,8 @@ class AVFuzzer(Fuzzer):
         else:
             self.time_counter = 0.0
             logger.info("Start from scratch, time counter reset to 0.")    
+            
+        self.setup_deap()
 
     def setup_deap(self):
         
@@ -84,11 +93,11 @@ class AVFuzzer(Fuzzer):
         if not hasattr(creator, "Individual"):
             creator.create("Individual", FuzzSeed, fitness=creator.FitnessMin)
         
-        self.toolbox.register("mutate_resample", self.mutate_resample)
         self.toolbox.register("evaluate", self.evaluate)
         self.toolbox.register("mutate", self.mutation)
         self.toolbox.register("crossover", self.crossover) # random
-        self.toolbox.register("select", tools.selTournament) # to
+        # self.toolbox.register("select", tools.selTournament) # to
+        self.toolbox.register("select", tools.selTournament, tournsize=self.tournsize)
         
         # setup parallel pool
         self.parallel_num = GlobalConfig.parallel_num
@@ -100,33 +109,37 @@ class AVFuzzer(Fuzzer):
             self.toolbox.register("map", map)
             self.pool = None
             logger.info("Sequential evaluation (parallel_num=1).")
-    
+        
+        if len(self.pop) > 0:
+            if not isinstance(self.pop[0], creator.Individual):
+                ind_pop = [
+                    creator.Individual(
+                        **seed.to_deap_args()
+                    ) for seed in self.pop
+                ]
+                self.pop = ind_pop
+                
     def close(self):
         if self.pool is not None:
             self.pool.close()
             self.pool.join()
             
     def load_checkpoint(self):
+        
         if os.path.exists(self.checkpoint_path):
             with open(self.checkpoint_path, 'rb') as f:
                 checkpoint_data = pickle.load(f)
             
             self.population_size = checkpoint_data['population_size']
+            self.tournsize = self.pipeline_config['tournsize']
             self.generation_step = checkpoint_data['generation_step']
             self.seed_recorder = checkpoint_data['seed_recorder']
             self.F_corpus = checkpoint_data['F_corpus']
             self.best_score = checkpoint_data['best_score']
-            _pop = [
-                FuzzSeed.load_from_dict(seed_dict) for seed_dict in checkpoint_data['pop']
-            ]
+            self.ga_init_seed = FuzzSeed.load_from_dict(checkpoint_data['ga_init_seed'])
+            
             self.pop = [
-                creator.Individual(
-                    id=seed.id,
-                    scenario=seed.scenario,
-                    oracle_result=seed.oracle_result,
-                    feedback_result=seed.feedback_result,
-                    is_expected=seed.is_expected,
-                ) for seed in _pop
+                FuzzSeed.load_from_dict(seed_dict) for seed_dict in checkpoint_data['pop']
             ]
             self.initial_seed = FuzzSeed.load_from_dict(checkpoint_data['initial_seed'])
             
@@ -134,8 +147,6 @@ class AVFuzzer(Fuzzer):
             logbook_file = os.path.join(self.output_root, "logbook.json")
             if os.path.exists(logbook_file):
                 with open(logbook_file, 'r') as f:
-                    self.logbook = tools.Logbook()
-                    self.logbook.header = ["gen", "fitness", "best_so_far"]
                     log_data = json.load(f)
                     for entry in log_data:
                         self.logbook.record(**entry)
@@ -150,12 +161,14 @@ class AVFuzzer(Fuzzer):
         """
         checkpoint_data = {
             "population_size": self.population_size,
+            "tournsize": self.tournsize,
             "generation_step": self.generation_step,
             "F_corpus": self.F_corpus,
             "seed_recorder": self.seed_recorder,
             "pop": [seed.to_dict() for seed in self.pop], # TODO: check this
             "initial_seed": self.initial_seed.to_dict(),
             "best_score": self.best_score,
+            "ga_init_seed": self.ga_init_seed.to_dict() if self.ga_init_seed is not None else None,
         }
         with open(self.checkpoint_path, 'wb') as f:
             pickle.dump(checkpoint_data, f)            
@@ -192,8 +205,21 @@ class AVFuzzer(Fuzzer):
         with open(os.path.join(self.output_root, "logbook.json"), 'w') as f:
             json.dump(self.logbook, f, indent=2, default=str)
             
-    def crossover(self, ind1: FuzzSeed, ind2: FuzzSeed) -> (FuzzSeed, FuzzSeed):
+    def crossover(self, ind1: FuzzSeed, ind2: FuzzSeed) -> Tuple[FuzzSeed, FuzzSeed]:
         # not used in current fuzzer
+        logger.info("Start crossover ...")        
+        ctn_config = self.ctn_manager.acquire()
+        ctn_operator = CtnSimOperator(
+            idx=ctn_config.idx,
+            container_name=ctn_config.container_name,
+            gpu=ctn_config.gpu,
+            random_seed=ctn_config.random_seed,
+            docker_image=ctn_config.docker_image,
+            fps=ctn_config.fps,
+            is_sync_mode=ctn_config.is_sync_mode
+        )
+        ctn_operator.start()
+        ind1, ind2 = self.mutator.crossover_scenarios(ind1, ind2, ctn_operator)
         return ind1, ind2
     
     def mutation(self, source_seed: FuzzSeed) -> FuzzSeed:
@@ -213,11 +239,9 @@ class AVFuzzer(Fuzzer):
         )
         ctn_operator.start()
         
-        op_seed = self.mutator.generate(
+        op_seed = self.mutator.perturb_scenario(
             source_seed=op_seed,
-            ctn_operator=ctn_operator,
-            ego_entry_point=self.agent_entry_point,
-            ego_config_path=self.agent_config_path
+            ctn_operator=ctn_operator
         )       
         self.ctn_manager.release(ctn_config) 
         return op_seed
@@ -233,8 +257,12 @@ class AVFuzzer(Fuzzer):
         # Run execution in parallel (container + scenario simulation)
         exec_results = self.execute_population(individuals)
 
-        for ind_index, scenario_dir in exec_results:
+        for ind_index, scenario_exec_status, scenario_dir in exec_results:
+
             # Evaluate oracle and feedback on the produced scenario
+            if not scenario_exec_status:
+                # has error of this execution
+                continue
             
             visualize_trajectories(scenario_dir)
             
@@ -250,13 +278,12 @@ class AVFuzzer(Fuzzer):
             )
 
             ind = individuals[ind_index]
-            
             ind.oracle_result = oracle_result
-            ind.is_expected = oracle_result['expected']
             ind.feedback_result = feedback_result
 
             # Example: use feedback score as fitness
-            score = feedback_result.get("score", float("inf"))
+            ind.is_expected = oracle_result['expected']
+            score = feedback_result['score']
             ind.fitness.values = (score, )
             
             # add breif
@@ -282,20 +309,41 @@ class AVFuzzer(Fuzzer):
 
         return individuals
     
-    def restart_ga_seed(self):
+    def resample_initial_scenario(self) -> FuzzSeed:
+        # this should be in the logical scenario space
+        logger.info("Start scenario resampling ...")        
+        ctn_config = self.ctn_manager.acquire()
+        ctn_operator = CtnSimOperator(
+            idx=ctn_config.idx,
+            container_name=ctn_config.container_name,
+            gpu=ctn_config.gpu,
+            random_seed=ctn_config.random_seed,
+            docker_image=ctn_config.docker_image,
+            fps=ctn_config.fps,
+            is_sync_mode=ctn_config.is_sync_mode
+        )
+        ctn_operator.start()
+        
+        
         self.generation_step += 1
         ind_id = f'gen_{self.generation_step}_initial'
         
-        ind = creator.Individual(
-            **self.initial_seed.to_deap_args()
-        )
+        ind = copy.deepcopy(self.initial_seed)
         ind.set_id(ind_id)
-        ind, = self.toolbox.mutate_resample(ind)
-        del ind.fitness.values
+        ind = self.mutator.generate(
+            source_seed=ind,
+            ctn_operator=ctn_operator,
+            ego_entry_point=self.agent_entry_point,
+            ego_config_path=self.agent_config_path
+        )
+                
         return ind
 
     def run(self):
         start_time = datetime.now()
+        
+        if self.ga_init_seed is None:
+            self.ga_init_seed = self.resample_initial_scenario()
 
         # ========== Initialize population ==========
         if len(self.pop) != self.population_size:
@@ -306,16 +354,12 @@ class AVFuzzer(Fuzzer):
                 ind_id = f'gen_{self.generation_step}_ind_{i}'
 
                 ind = creator.Individual(
-                    id=ind_id,
-                    scenario=copy.deepcopy(self.initial_seed.scenario),
-                    oracle_result={},
-                    feedback_result={},
-                    is_expected=False,
+                    **self.ga_init_seed.to_deap_args()
                 )
                 ind.set_id(ind_id)
 
                 # mutation
-                ind, = self.toolbox.mutate(ind)
+                ind = self.toolbox.mutate(ind)
                 del ind.fitness.values
                 self.pop.append(ind)
 
@@ -333,15 +377,29 @@ class AVFuzzer(Fuzzer):
             logger.info(f"=== Generation {self.generation_step} ===")
 
             # selection + clone
-            offspring = self.toolbox.select(self.pop, len(self.pop))
+            offspring = self.toolbox.select(self.pop, self.population_size)
             offspring = list(map(copy.deepcopy, offspring))
+            
+            # crossover
+            for i in range(1, len(offspring), 2):
+                if random.random() < self.crossover_prob:
+                    ind1, ind2 = offspring[i - 1], offspring[i]
+                    cross_id1 = f'gen_{self.generation_step}_ind_{i-1}'
+                    cross_id2 = f'gen_{self.generation_step}_ind_{i}'
+                    offspring[i - 1], offspring[i] = self.toolbox.crossover(ind1, ind2)
+                    offspring[i - 1].set_id(cross_id1)
+                    offspring[i].set_id(cross_id2)
+                    if hasattr(offspring[i - 1].fitness, "values"):
+                        del offspring[i - 1].fitness.values
+                    if hasattr(offspring[i].fitness, "values"):
+                        del offspring[i].fitness.values
 
             # mutation
             for i in range(len(offspring)):
                 if random.random() < self.mutation_prob:
                     mut_id = f'gen_{self.generation_step}_ind_{i}'
+                    offspring[i] = self.toolbox.mutate(offspring[i])
                     offspring[i].set_id(mut_id)
-                    offspring[i], = self.toolbox.mutate(offspring[i])
                     if hasattr(offspring[i].fitness, "values"):
                         del offspring[i].fitness.values
 
@@ -355,9 +413,9 @@ class AVFuzzer(Fuzzer):
 
             # ========== Metrics ==========
             best = tools.selBest(self.pop, 1)[0]
-            logger.debug(f"Best individual: {best.id} with fitness {best.fitness.values}")
+            logger.info(f"Best individual: {best.id} with fitness {best.fitness.values}")
             best_val = best.fitness.values[0]
-            best_fitness_so_far = min(best_fitness_so_far, best_val)
+            self.best_score = min(self.best_score, best_val)
 
             self.logbook.record(
                 gen=self.generation_step,
@@ -368,7 +426,7 @@ class AVFuzzer(Fuzzer):
             logger.info(
                 f"[Gen {self.generation_step}] "
                 f"Best of generation = {best_val:.4f}, "
-                f"Best so far = {best_fitness_so_far:.4f}"
+                f"Best so far = {self.best_score:.4f}"
             )
 
             self.save_checkpoint()

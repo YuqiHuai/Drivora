@@ -17,7 +17,7 @@ carla_image="carlasim/carla:0.9.15"
 # ==== Agent Config ====
 agent_name="orion"
 agent_entry_point="agent_corpus.orion.orion_b2d_agent:OrionAgent"
-agent_config_path="agent_corpus/orion/adzoo/orion/configs/orion_stage3_agent.py+agent_corpus/orion/ckpts/Orion.pth"
+agent_config_path="agent_corpus/orion/adzoo/orion/configs/orion_stage3_fp16.py+agent_corpus/orion/ckpts/Orion.pth"
 
 # ==== Scenario Config ====
 seed_segment="route_100_200"

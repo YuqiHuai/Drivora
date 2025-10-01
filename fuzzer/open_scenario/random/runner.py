@@ -75,7 +75,11 @@ class RandomFuzzer(Fuzzer):
             self.time_counter = 0.0
             logger.info("Start from scratch, time counter reset to 0.")    
 
+        # 9. setup deap toolbox
+        self.setup_deap()
+        
     def setup_deap(self):
+        
         self.toolbox = base.Toolbox()
         if not hasattr(creator, "FitnessMin"):
             creator.create("FitnessMin", base.Fitness, weights=(-1.0,))
@@ -96,7 +100,17 @@ class RandomFuzzer(Fuzzer):
             self.toolbox.register("map", map)
             self.pool = None
             logger.info("Sequential evaluation (parallel_num=1).")
-    
+
+        if len(self.pop) > 0:
+            if not isinstance(self.pop[0], creator.Individual):
+                ind_pop = [
+                    creator.Individual(
+                        **seed.to_deap_args()
+                    ) for seed in self.pop
+                ]
+                self.pop = ind_pop
+                
+                
     def close(self):
         if self.pool is not None:
             self.pool.close()
@@ -112,13 +126,8 @@ class RandomFuzzer(Fuzzer):
             self.seed_recorder = checkpoint_data['seed_recorder']
             self.F_corpus = checkpoint_data['F_corpus']
             self.best_score = checkpoint_data['best_score']
-            _pop = [
-                FuzzSeed.load_from_dict(seed_dict) for seed_dict in checkpoint_data['pop']
-            ]
             self.pop = [
-                creator.Individual(
-                    **seed.to_deap_args()
-                ) for seed in _pop
+                FuzzSeed.load_from_dict(seed_dict) for seed_dict in checkpoint_data['pop']
             ]
             self.initial_seed = FuzzSeed.load_from_dict(checkpoint_data['initial_seed'])
             
@@ -126,8 +135,6 @@ class RandomFuzzer(Fuzzer):
             logbook_file = os.path.join(self.output_root, "logbook.json")
             if os.path.exists(logbook_file):
                 with open(logbook_file, 'r') as f:
-                    self.logbook = tools.Logbook()
-                    self.logbook.header = ["gen", "fitness", "best_so_far"]
                     log_data = json.load(f)
                     for entry in log_data:
                         self.logbook.record(**entry)
@@ -221,8 +228,13 @@ class RandomFuzzer(Fuzzer):
         # Run execution in parallel (container + scenario simulation)
         exec_results = self.execute_population(individuals)
 
-        for ind_index, scenario_dir in exec_results:
+        for ind_index, scenario_exec_status, scenario_dir in exec_results:
             # Evaluate oracle and feedback on the produced scenario
+            
+            if not scenario_exec_status:
+                # has error of this execution
+                # no update this individual
+                continue
             
             visualize_trajectories(scenario_dir)
             
@@ -328,7 +340,7 @@ class RandomFuzzer(Fuzzer):
 
             # ========== Metrics ==========
             best = tools.selBest(self.pop, 1)[0]
-            logger.debug(f"Best individual: {best.id} with fitness {best.fitness.values}")
+            logger.info(f"Best individual: {best.id} with fitness {best.fitness.values}")
             best_val = best.fitness.values[0]
             self.best_score = min(self.best_score, best_val)
 
