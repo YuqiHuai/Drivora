@@ -25,14 +25,14 @@ except ModuleNotFoundError:
 OLD_CARLA_VERSION = Version("0.9.12")
 
 from omegaconf import DictConfig
-from typing import List
+from typing import List, Tuple
 from loguru import logger
 
 from scenario_corpus.open_scenario.config import Waypoint, WaypointVehicleConfig, AIWalkerConfig, TrafficLightBehaviorConfig, WeatherConfig, StaticObstacleConfig
 from agent_corpus.atomic.route_manipulation import GlobalRoutePlanner
 from scenario_runner.ctn_operator import CtnSimOperator
 
-from .seed import BehSeed
+from fuzzer.open_scenario.base import FuzzSeed
 
 class ScenarioSpace:
     """Define the mutation space for OpenSCENARIO scenarios."""
@@ -553,11 +553,11 @@ class ScenarioMutator:
     ####### Main Interface #########
     def generate(
         self, 
-        source_seed: BehSeed,
+        source_seed: FuzzSeed,
         ctn_operator: CtnSimOperator,
         ego_entry_point: str, 
         ego_config_path: str
-    ) -> BehSeed:
+    ) -> FuzzSeed:
         
         mutated_seed = copy.deepcopy(source_seed)
         mutated_scenario = mutated_seed.scenario
@@ -888,9 +888,9 @@ class ScenarioMutator:
     
     def perturb_scenario(
         self,
-        source_seed: BehSeed,
+        source_seed: FuzzSeed,
         ctn_operator: CtnSimOperator
-    ) -> BehSeed:
+    ) -> FuzzSeed:
         # We currently implement a simple mutation strategies
         
         mutated_seed = copy.deepcopy(source_seed)
@@ -954,31 +954,107 @@ class ScenarioMutator:
         self._cleanup()
         return mutated_seed
     
-    def step(
+    def crossover_scenarios(
         self,
-        source_seed: BehSeed,
-        ctn_operator: CtnSimOperator,
-        mutation_stage: str = "small" # or "large"
-    ) -> BehSeed:
-        new_seed = copy.deepcopy(source_seed)
+        seed1: FuzzSeed,
+        seed2: FuzzSeed,
+        ctn_operator: CtnSimOperator
+    ) -> Tuple[FuzzSeed, FuzzSeed]:
+        # TODO: refine and add checker
         
-        if mutation_stage == "small":
-            logger.info("Performing small mutation...")
-            new_seed = self.perturb_scenario(
-                source_seed=new_seed,
-                ctn_operator=ctn_operator
-            )
+        # crossover two scenarios by exchanging npc vehicles
         
-        elif mutation_stage == "large":
-            logger.info("Performing large mutation...")
-            new_seed = self.generate(
-                source_seed=new_seed,
-                ctn_operator=ctn_operator,
-                ego_entry_point=new_seed.scenario.ego_vehicles[0].entry_point,
-                ego_config_path=new_seed.scenario.ego_vehicles[0].config_path
-            )
-            
+        if seed1.scenario.map_region.town != seed2.scenario.map_region.town:
+            logger.warning("Crossover failed due to different towns.")
+            raise ValueError("Crossover failed due to different towns.")
+        
+        mutated_seed1 = copy.deepcopy(seed1)
+        mutated_seed2 = copy.deepcopy(seed2)
+        
+        mutated_scenario = mutated_seed1.scenario
+        
+        # setup ctn
+        self.ctn_operator = ctn_operator
+        map_region = mutated_scenario.map_region
+
+        # load town & info
+        try:
+            self._setup(map_region.town)
+        except Exception as e:
+            self.ctn_operator.start()
+            try:
+                self._setup(map_region.town)
+            except Exception as e:
+                logger.error(traceback.print_exc())
+                return None
+        
+        # crossover npc vehicles
+        npc_vehicles_1 = seed1.scenario.npc_vehicles
+        npc_vehicles_2 = seed2.scenario.npc_vehicles
+        
+        if len(npc_vehicles_1) != len(npc_vehicles_2):
+            raise ValueError("Crossover failed due to different npc vehicle numbers.")
+        
+        split_point = random.randint(1, len(npc_vehicles_1))        
+        new_npc_vehicles_1 = npc_vehicles_1[:split_point] + npc_vehicles_2[split_point:]
+        new_npc_vehicles_2 = npc_vehicles_2[:split_point] + npc_vehicles_1[split_point:]
+        
+        # crossover npc walkers
+        npc_walkers_1 = seed1.scenario.npc_walkers
+        npc_walkers_2 = seed2.scenario.npc_walkers
+        
+        if len(npc_walkers_1) != len(npc_walkers_2):
+            raise ValueError("Crossover failed due to different npc walker numbers.")
+        
+        split_point = random.randint(1, len(npc_walkers_1))        
+        new_npc_walkers_1 = npc_walkers_1[:split_point] + npc_walkers_2[split_point:]
+        new_npc_walkers_2 = npc_walkers_2[:split_point] + npc_walkers_1[split_point:]
+        
+        # crossover npc statics
+        npc_statics_1 = seed1.scenario.npc_statics
+        npc_statics_2 = seed2.scenario.npc_statics
+        
+        if len(npc_statics_1) != len(npc_statics_2):
+            raise ValueError("Crossover failed due to different npc static numbers.")
+        
+        split_point = random.randint(1, len(npc_statics_1))        
+        new_npc_statics_1 = npc_statics_1[:split_point] + npc_statics_2[split_point:]
+        new_npc_statics_2 = npc_statics_2[:split_point] + npc_statics_1[split_point:]
+        
+        # crossover weather
+        weather_1 = seed1.scenario.weather
+        weather_2 = seed2.scenario.weather
+        if random.random() < 0.5:
+            new_weather_1 = weather_1
+            new_weather_2 = weather_2
         else:
-            raise ValueError(f"Unsupported mutation stage {mutation_stage}")
+            new_weather_1 = weather_2
+            new_weather_2 = weather_1
             
-        return new_seed
+        # crossover traffic light
+        traffic_light_1 = seed1.scenario.traffic_light
+        traffic_light_2 = seed2.scenario.traffic_light
+        if random.random() < 0.5:
+            new_traffic_light_1 = traffic_light_1
+            new_traffic_light_2 = traffic_light_2
+        else:
+            new_traffic_light_1 = traffic_light_2
+            new_traffic_light_2 = traffic_light_1
+        
+        # assign to seeds
+        # new seed 1
+        mutated_seed1.scenario.npc_vehicles = new_npc_vehicles_1
+        mutated_seed1.scenario.npc_walkers = new_npc_walkers_1
+        mutated_seed1.scenario.npc_statics = new_npc_statics_1
+        mutated_seed1.scenario.weather = new_weather_1
+        mutated_seed1.scenario.traffic_light = new_traffic_light_1
+        # new seed 2
+        mutated_seed2.scenario.npc_vehicles = new_npc_vehicles_2
+        mutated_seed2.scenario.npc_walkers = new_npc_walkers_2
+        mutated_seed2.scenario.npc_statics = new_npc_statics_2
+        mutated_seed2.scenario.weather = new_weather_2
+        mutated_seed2.scenario.traffic_light = new_traffic_light_2      
+        
+        self._cleanup()
+        return mutated_seed1, mutated_seed2
+    

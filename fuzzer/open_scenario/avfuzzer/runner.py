@@ -23,8 +23,8 @@ from .mutator import ScenarioMutator
 from .feedback import FeedbackCalculator
 from .oracle import ScenarioOracle
 
-@FUZZER_REGISTRY.register("fuzzer.open_scenario.avfuzzer")
-class AVFuzzer(Fuzzer):
+@FUZZER_REGISTRY.register("fuzzer.open_scenario.drivefuzz")
+class DriveFuzz(Fuzzer):
     """
     # TODO: add resampling logics
     """
@@ -35,7 +35,7 @@ class AVFuzzer(Fuzzer):
         agent_config: DictConfig,
         scenario_config: DictConfig
     ):
-        super(AVFuzzer, self).__init__(
+        super(DriveFuzz, self).__init__(
             fuzzer_config,
             agent_config,
             scenario_config

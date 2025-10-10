@@ -164,7 +164,7 @@ Below is an overview of the supported agents and their default configurations:
 | Orion      | Vision-Language-based | [Orion](https://github.com/xiaomi-mlab/Orion)                                                         | `agent_corpus.orion.orion_b2d_agent:OrionAgent`       | `agent_corpus/orion/adzoo/orion/configs/orion_stage3_agent.py+agent_corpus/orion/ckpts/Orion.pth`                                                   |
 | Pylot      | Module-based          | [pylot](https://github.com/erdos-project/pylot)                                                       | *Will be released soon*                              | *Will be released soon*                                                     |
 
-📌 See the [Agent Corpus](agents/README.md) for more details and instructions on integrating your own ADS.
+📌 See the [Agent Corpus](agents/README.md) for more details and instructions on integrating your own ADS. We also encourage contributions that incorporate Baidu Apollo and Autoware into our framework — we welcome collaborations to complete this integration.
 
 ## 🔬 Fuzzing/Testing Tools
 
@@ -173,12 +173,12 @@ Drivora incorporates multiple ADS fuzzers, each with different scenario definiti
 ✅ **Currently Supported Tools**
 - [Random](fuzzer/open_scenario/random)  
 - [AVFuzzer](fuzzer/open_scenario/avfuzzer)  
-- [Behavexplor](fuzzer/open_scenario/behavexplor)  
-- [SAMOTA](fuzzer/open_scenario/samota)  
+- [Behavexplor](fuzzer/open_scenario/behavexplor)   
 - [DriveFuzz](fuzzer/open_scenario/drivefuzz)
+- [SAMOTA](fuzzer/open_scenario/samota) 
 - ... 🔄 more coming soon!
 
-⚠️ **Note**: We cannot guarantee that the performance reproced by Drivora will be fully consistent with the results in the original papers, as different platforms may lead to variations.  Some components are still under development — we will continue to update the repository and address issues over time.
+⚠️ **Note**: We provide prototype implementations according to the original paper designs. These prototypes follow the core methodology but are not guaranteed to be fully identical to the original implementations or reproduce their exact performance. Some components are still under active development — we will continue to improve and update the repository over time.
 
 ### 🧩 Extension
 

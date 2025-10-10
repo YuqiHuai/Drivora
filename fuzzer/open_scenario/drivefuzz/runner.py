@@ -4,29 +4,30 @@ import json
 import pickle
 import random
 import multiprocessing
-import numpy as np
 
 from loguru import logger
+from typing import Tuple, Optional
 from datetime import datetime
 from omegaconf import DictConfig
-from deap import base, tools
-from typing import List
+from deap import base, creator, tools
 
 from registry import FUZZER_REGISTRY
 
 from scenario_runner.config import GlobalConfig
 from scenario_runner.ctn_manager import CtnSimOperator
 
-from fuzzer.open_scenario.base import Fuzzer
+from fuzzer.open_scenario.base import Fuzzer, FuzzSeed
 from tools.recorder_tool import load_observation, load_runtime_result, visualize_trajectories
 
 from .mutator import ScenarioMutator
 from .feedback import FeedbackCalculator
 from .oracle import ScenarioOracle
-from .seed import BehSeed
 
-@FUZZER_REGISTRY.register("fuzzer.open_scenario.behavexplor")
-class BehAVExplor(Fuzzer):
+@FUZZER_REGISTRY.register("fuzzer.open_scenario.avfuzzer")
+class AVFuzzer(Fuzzer):
+    """
+    # TODO: add resampling logics
+    """
     
     def __init__(
         self, 
@@ -34,7 +35,7 @@ class BehAVExplor(Fuzzer):
         agent_config: DictConfig,
         scenario_config: DictConfig
     ):
-        super(BehAVExplor, self).__init__(
+        super(AVFuzzer, self).__init__(
             fuzzer_config,
             agent_config,
             scenario_config
@@ -53,25 +54,22 @@ class BehAVExplor(Fuzzer):
         
         ###### The following should be in checkpoint ########
         # 5. pipeline config
-        self.initial_corpus_size = self.pipeline_config.get('initial_corpus_size', 4)
-        self.batch_size = GlobalConfig.parallel_num # we use the parallel number as batch size
+        self.population_size = 1
         
         # 6. internal parameters & checkpoint information
         # internal parameters used in fuzzer
-        # we need (1) all seeds, (2) corpus index and 
         self.generation_step = 0
-        self.best_safety = 1.0 # lower is better
-        self.best_diversity = 0.0 # larger is better
-        self.all_seeds: List[BehSeed] = [] 
-        self.seed_corpus: List[int] = [] # keeps existing seeds of index in all_seeds
-        self.F_corpus: List[int] = [] # keeps valid fault seeds of index in all_seeds
-        self.new_corpus: List[int] = [] # keeps valid new coverage seeds of index in all_seeds
+        self.seed_recorder = []
+        self.F_corpus = [] # save all expected corpus
+        self.best_score = float("inf") # min is better
+        self.pop = []
+        self.ga_init_seed: Optional[FuzzSeed] = None
         
         self.logbook = tools.Logbook()
-        self.logbook.header = ["gen", "safety", "diversity"]
+        self.logbook.header = ["gen", "fitness", "best_so_far"]
         
         # 7. load initial seed
-        self.initial_seed = BehSeed.load_from_scenario_file(self.seed_path)
+        self.initial_seed = FuzzSeed.load_from_scenario_file(self.seed_path)
         
         # 8. load checkpoint path
         if self.resume:
@@ -80,19 +78,22 @@ class BehAVExplor(Fuzzer):
         else:
             self.time_counter = 0.0
             logger.info("Start from scratch, time counter reset to 0.")    
-
-        # 9. setup deap toolbox
+            
         self.setup_deap()
 
     def setup_deap(self):
         
         self.toolbox = base.Toolbox()
+        if not hasattr(creator, "FitnessMin"):
+            creator.create("FitnessMin", base.Fitness, weights=(-1.0,)) # min is better
+            
+        if not hasattr(creator, "Individual"):
+            creator.create("Individual", FuzzSeed, fitness=creator.FitnessMin)
         
-        self.toolbox.register("initialize_individual", self.initialize_individual)
         self.toolbox.register("evaluate", self.evaluate)
         self.toolbox.register("mutate", self.mutation)
-        self.toolbox.register("select", self.select) # random
-        self.toolbox.register("update_corpus", self.update_corpus)
+        # self.toolbox.register("select", tools.selTournament) # to
+        self.toolbox.register("select", tools.selBest)
         
         # setup parallel pool
         self.parallel_num = GlobalConfig.parallel_num
@@ -104,31 +105,38 @@ class BehAVExplor(Fuzzer):
             self.toolbox.register("map", map)
             self.pool = None
             logger.info("Sequential evaluation (parallel_num=1).")
-    
+        
+        if len(self.pop) > 0:
+            if not isinstance(self.pop[0], creator.Individual):
+                ind_pop = [
+                    creator.Individual(
+                        **seed.to_deap_args()
+                    ) for seed in self.pop
+                ]
+                self.pop = ind_pop
+                
     def close(self):
         if self.pool is not None:
             self.pool.close()
             self.pool.join()
             
     def load_checkpoint(self):
+        
         if os.path.exists(self.checkpoint_path):
             with open(self.checkpoint_path, 'rb') as f:
                 checkpoint_data = pickle.load(f)
             
-            self.initial_corpus_size = checkpoint_data['initial_corpus_size']
+            self.population_size = checkpoint_data['population_size']
             self.generation_step = checkpoint_data['generation_step']
+            self.seed_recorder = checkpoint_data['seed_recorder']
             self.F_corpus = checkpoint_data['F_corpus']
-            self.seed_corpus = checkpoint_data['seed_corpus']
-            self.new_corpus = checkpoint_data['new_corpus']
-            self.best_safety = checkpoint_data['best_safety']
-            self.best_diversity = checkpoint_data['best_diversity']
+            self.best_score = checkpoint_data['best_score']
+            self.ga_init_seed = FuzzSeed.load_from_dict(checkpoint_data['ga_init_seed'])
             
-            self.all_seeds = [
-                BehSeed.load_from_dict(seed_dict) for seed_dict in checkpoint_data['all_seeds']
+            self.pop = [
+                FuzzSeed.load_from_dict(seed_dict) for seed_dict in checkpoint_data['pop']
             ]
-            self.initial_seed = BehSeed.load_from_dict(checkpoint_data['initial_seed'])
-            
-            self.feedback.load_checkpoint(checkpoint_data['feedback_model'])
+            self.initial_seed = FuzzSeed.load_from_dict(checkpoint_data['initial_seed'])
             
             # load logbook
             logbook_file = os.path.join(self.output_root, "logbook.json")
@@ -147,16 +155,14 @@ class BehAVExplor(Fuzzer):
         Save checkpoint
         """
         checkpoint_data = {
-            "best_safety": self.best_safety,
-            "best_diversity": self.best_diversity,
-            "initial_corpus_size": self.initial_corpus_size,
+            "population_size": self.population_size,
             "generation_step": self.generation_step,
             "F_corpus": self.F_corpus,
-            "seed_corpus": self.seed_corpus,
-            "new_corpus": self.new_corpus,
-            "all_seeds": [seed.to_dict() for seed in self.all_seeds],
+            "seed_recorder": self.seed_recorder,
+            "pop": [seed.to_dict() for seed in self.pop], # TODO: check this
             "initial_seed": self.initial_seed.to_dict(),
-            "feedback_model": self.feedback.save_checkpoint(os.path.dirname(self.checkpoint_path))
+            "best_score": self.best_score,
+            "ga_init_seed": self.ga_init_seed.to_dict() if self.ga_init_seed is not None else None,
         }
         with open(self.checkpoint_path, 'wb') as f:
             pickle.dump(checkpoint_data, f)            
@@ -167,27 +173,23 @@ class BehAVExplor(Fuzzer):
             'summary': {
                 'total_iterations': self.generation_step,
                 'F_size': len(self.F_corpus),
-                'best_safety': self.best_safety,
-                'best_diversity': self.best_diversity,
-                'new_coverage_size': len(self.new_corpus),
                 'time_budget_hours': self.time_budget,
                 'time_used_hours': self.used_time / 3600.0,
-                'seed_corpus_size': len(self.seed_corpus),
-                'total_seeds': len(self.all_seeds),
-                'F_corpus': self.F_corpus,
+                'best_score': self.best_score,
+                'F_corpus': self.F_corpus
             },
             'details': {
             }
         }
         
-        for seed in self.all_seeds:
+        for seed_brief in self.seed_recorder:
             overview_item_detail = {
-                'scenario_id': seed.id,
-                'is_expected': seed.is_expected,
-                'oracle_result': seed.oracle_result,
-                'feedback_result': seed.feedback_result,
+                'scenario_id': seed_brief['id'],
+                'is_expected': seed_brief['is_expected'],
+                'oracle_result': seed_brief['oracle_result'],
+                'feedback_result': seed_brief['feedback_result'],
             }
-            overview_res['details'][seed.id] = overview_item_detail
+            overview_res['details'][seed_brief['id']] = overview_item_detail
             
         overview_res_file = os.path.join(self.output_root, 'overview.json')
         with open(overview_res_file, 'w') as f:
@@ -197,105 +199,9 @@ class BehAVExplor(Fuzzer):
         with open(os.path.join(self.output_root, "logbook.json"), 'w') as f:
             json.dump(self.logbook, f, indent=2, default=str)
     
-    def initialize_individual(self, ind: BehSeed) -> BehSeed:
-        # initialize the individual by mutating the initial seed
-        logger.info("Initialize individual ...")
-        
-        op_seed = copy.deepcopy(ind)
-        
-        ctn_config = self.ctn_manager.acquire()
-        ctn_operator = CtnSimOperator(
-            idx=ctn_config.idx,
-            container_name=ctn_config.container_name,
-            gpu=ctn_config.gpu,
-            random_seed=ctn_config.random_seed,
-            docker_image=ctn_config.docker_image,
-            fps=ctn_config.fps,
-            is_sync_mode=ctn_config.is_sync_mode
-        )
-        ctn_operator.start()
-        
-        op_seed = self.mutator.generate(
-            source_seed=op_seed,
-            ctn_operator=ctn_operator,
-            ego_entry_point=self.agent_entry_point,
-            ego_config_path=self.agent_config_path
-        )       
-        self.ctn_manager.release(ctn_config) 
-        return op_seed
-    
-    def update_corpus(self, seed: BehSeed):
-        
-        # update to dataset
-        seed.energy = 1.0 # as new seed
-        self.all_seeds.append(copy.deepcopy(seed))
-        parent_index = seed.parent_index
-        
-        if parent_index <= 0:
-            logger.info("Add seed {} to corpus (no parent).", seed.id)
-            self.seed_corpus.append(len(self.all_seeds) - 1)
-            return
-        
-        # find violations
-        if seed.is_expected == True:
-            logger.info("Add seed {} to corpus (expected).", seed.id)
-            self.F_corpus.append(len(self.all_seeds) - 1)
-            self.all_seeds[parent_index].fail_num += 1
-                        
-        # update for safe seeds
-        parent_safety_score = self.all_seeds[parent_index].safety_score
-        child_safety_score = seed.safety_score
-        
-        parent_energy = self.all_seeds[parent_index].energy
-        parent_select_num = self.all_seeds[parent_index].select_num
-        parent_fail_num = self.all_seeds[parent_index].fail_num
-        
-        delta_safety = parent_safety_score - child_safety_score
-        
-        if parent_select_num == 0:
-            delta_fail = 0.0
-        else:
-            delta_fail = parent_fail_num / float(parent_select_num + 1e-5)
-        
-        delta_select = - 0.1
-        new_energy = parent_energy + 0.3 * np.tanh(delta_safety) + 0.5 * delta_fail + delta_select
-        new_energy = float(np.clip(new_energy, 0.0, 1.0))
-        self.all_seeds[parent_index].energy = new_energy
-        
-        # update corpus
-        if not seed.is_expected:
-            if child_safety_score < parent_safety_score:
-                logger.info("Add seed {} to corpus (better safety).", seed.id)
-                self.seed_corpus.append(len(self.all_seeds) - 1)
-            elif seed.is_new == True:
-                logger.info("Add seed {} to corpus (new coverage).", seed.id)
-                self.seed_corpus.append(len(self.all_seeds) - 1)
-                self.new_corpus.append(len(self.all_seeds) - 1)
-            else:
-                logger.info("Do not add seed {} to corpus (not better).", seed.id)
-        
-    def select(self) -> BehSeed:
-        
-        corpus_energy = [self.all_seeds[i].energy for i in self.seed_corpus]
-                
-        select_probabilities = corpus_energy
-        select_probabilities = np.array(select_probabilities) + 1e-5
-        select_probabilities /= (select_probabilities.sum())
-        source_seed_corpus_index = np.random.choice(list(np.arange(0, len(self.seed_corpus))), p=select_probabilities)
-        source_seed_index = self.seed_corpus[source_seed_corpus_index]
-        
-        selected_seed = self.all_seeds[source_seed_index]
-        selected_seed.select_num += 1
-        self.all_seeds[source_seed_index] = selected_seed
-        
-        op_seed = copy.deepcopy(selected_seed)
-        op_seed.parent_index = source_seed_index
-        return op_seed
-    
-    def mutation(self, source_seed: BehSeed) -> BehSeed:
+    def mutation(self, source_seed: FuzzSeed) -> FuzzSeed:
         # this should be in the logical scenario space
         logger.info("Start mutation ...")
-        
         op_seed = copy.deepcopy(source_seed)
         
         ctn_config = self.ctn_manager.acquire()
@@ -310,22 +216,15 @@ class BehAVExplor(Fuzzer):
         )
         ctn_operator.start()
         
-        source_seed_energy = op_seed.energy
-        
-        if random.random() < source_seed_energy:
-            mutation_stage = 'small'
-        else:
-            mutation_stage = 'large'
-        
-        op_seed = self.mutator.step(
+        # TODO: should be replaced by the drivefuzz mutator
+        op_seed = self.mutator.perturb_scenario(
             source_seed=op_seed,
-            ctn_operator=ctn_operator,
-            mutation_stage=mutation_stage
+            ctn_operator=ctn_operator
         )       
         self.ctn_manager.release(ctn_config) 
         return op_seed
 
-    def evaluate(self, individuals: List[BehSeed]) -> List[BehSeed]:
+    def evaluate(self, individuals: list):
         """
         Evaluate a list of individuals using multiprocessing + container pool.
         Args:
@@ -337,7 +236,7 @@ class BehAVExplor(Fuzzer):
         exec_results = self.execute_population(individuals)
 
         for ind_index, scenario_exec_status, scenario_dir in exec_results:
-            
+
             # Evaluate oracle and feedback on the produced scenario
             if not scenario_exec_status:
                 # has error of this execution
@@ -357,15 +256,21 @@ class BehAVExplor(Fuzzer):
             )
 
             ind = individuals[ind_index]
-            ind.oracle_result = oracle_result            
+            ind.oracle_result = oracle_result
             ind.feedback_result = feedback_result
-            
-            # update some attributes
+
+            # Example: use feedback score as fitness
             ind.is_expected = oracle_result['expected']
-            ind.safety_score = feedback_result['safety_score']
-            ind.diversity_score = feedback_result['diversity_score']
-            ind.is_new = feedback_result['is_new']
-            ind.scenario_dir = scenario_dir
+            score = feedback_result['score']
+            ind.fitness.values = (score, )
+            
+            # add breif
+            self.seed_recorder.append({
+                'id': ind.id,
+                'is_expected': ind.is_expected,
+                'oracle_result': ind.oracle_result,
+                'feedback_result': ind.feedback_result,
+            })
             
             # add to F corpus
             if ind.is_expected:
@@ -373,9 +278,6 @@ class BehAVExplor(Fuzzer):
                     {
                         'id': ind.id,
                         'is_expected': ind.is_expected,
-                        'safety_score': ind.safety_score,
-                        'diversity_score': ind.diversity_score,
-                        'is_new': ind.is_new,
                         'oracle_result': ind.oracle_result,
                         'feedback_result': ind.feedback_result,
                     }
@@ -384,106 +286,110 @@ class BehAVExplor(Fuzzer):
             individuals[ind_index] = ind
 
         return individuals
+    
+    def resample_initial_scenario(self) -> FuzzSeed:
+        # this should be in the logical scenario space
+        logger.info("Start scenario resampling ...")        
+        ctn_config = self.ctn_manager.acquire()
+        ctn_operator = CtnSimOperator(
+            idx=ctn_config.idx,
+            container_name=ctn_config.container_name,
+            gpu=ctn_config.gpu,
+            random_seed=ctn_config.random_seed,
+            docker_image=ctn_config.docker_image,
+            fps=ctn_config.fps,
+            is_sync_mode=ctn_config.is_sync_mode
+        )
+        ctn_operator.start()
+        
+        
+        self.generation_step += 1
+        ind_id = f'gen_{self.generation_step}_initial'
+        
+        ind = copy.deepcopy(self.initial_seed)
+        ind.set_id(ind_id)
+        ind = self.mutator.generate(
+            source_seed=ind,
+            ctn_operator=ctn_operator,
+            ego_entry_point=self.agent_entry_point,
+            ego_config_path=self.agent_config_path
+        )
+                
+        return ind
 
     def run(self):
-        
-        # minimize is better
-        logger.info('===== Start Fuzzer (BehAVExplor) =====')
         start_time = datetime.now()
         
-        while len(self.seed_corpus) < self.initial_corpus_size:
-            
-            if self.termination_check(start_time):
-                break
-            
-            self.generation_step += 1
-            logger.info(f'==================== Run initial Iter {self.generation_step} ====================')
-            
-            pop = []
-            for i in range(self.batch_size):
-                
+        if self.ga_init_seed is None:
+            self.ga_init_seed = self.resample_initial_scenario()
+
+        # ========== Initialize population ==========
+        if len(self.pop) != self.population_size:
+            self.pop = []
+            for i in range(self.population_size):
+                logger.info(f"Initialize individual {i} in GA population.")
+
                 ind_id = f'gen_{self.generation_step}_ind_{i}'
-                ind = copy.deepcopy(self.initial_seed)
+
+                ind = creator.Individual(
+                    **self.ga_init_seed.to_deap_args()
+                )
                 ind.set_id(ind_id)
-                ind = self.toolbox.initialize_individual(ind)
-                pop.append(ind)
-                
-            pop = self.toolbox.evaluate(pop)
-            batch_max_diversity = np.max([ind.diversity_score for ind in pop])
-            
-            for ind in pop:
-                self.toolbox.update_corpus(ind)
-                
-                # update best safety and diversity
-                if ind.safety_score < self.best_safety:
-                    self.best_safety = ind.safety_score
-                if ind.diversity_score > self.best_diversity:
-                    self.best_diversity = ind.diversity_score
 
-            self.logbook.record(
-                gen=self.generation_step,
-                safety=self.best_safety,
-                diversity=batch_max_diversity
-            )
-            
-        # initialize the coverage model
-        if self.feedback.is_initialized == False:
-            logger.info("Initialize coverage model ...")
-            corpus_seeds = [self.all_seeds[i] for i in self.seed_corpus]
-            scenario_dir_list = [seed.scenario_dir for seed in corpus_seeds]
-            # load all observations
-            scenario_observation_list = []
-            for scenario_dir in scenario_dir_list:
-                scenario_observation = load_observation(scenario_dir)
-                scenario_observation_list.append(scenario_observation)
-            # initialize coverage model
-            self.feedback.initialize_coverage_model(
-                scenario_observation_list
-            )
-        
+                # mutation
+                ind = self.toolbox.mutate(ind)
+                del ind.fitness.values
+                self.pop.append(ind)
+
+        # evaluate the initial population
+        self.pop = self.evaluate(self.pop)
         self.save_checkpoint()
-         
-        # start fuzzing
-        logger.info(f'Initial corpus size reached: {len(self.seed_corpus)} seeds.')
-        logger.info(f'Start fuzzing ...')
 
+        # ========== GA loop ==========
         while True:
             
             if self.termination_check(start_time):
                 break
-            
+
             self.generation_step += 1
-            logger.info(f'==================== Run Iter {self.generation_step} ====================')
+            logger.info(f"=== Generation {self.generation_step} ===")
+
+            # selection + clone
+            offspring = self.toolbox.select(self.pop, self.population_size)
+            offspring = list(map(copy.deepcopy, offspring))
             
-            pop = []
-            for i in range(self.batch_size):
-                
-                ind_id = f'gen_{self.generation_step}_ind_{i}'
-                ind = self.toolbox.select()
-                ind.set_id(ind_id)                
-                ind = self.toolbox.mutate(ind)
-                
-                pop.append(ind)
-                                
+            # mutation
+            for i in range(len(offspring)):
+                mut_id = f'gen_{self.generation_step}_ind_{i}'
+                offspring[i] = self.toolbox.mutate(offspring[i])
+                offspring[i].set_id(mut_id)
+                if hasattr(offspring[i].fitness, "values"):
+                    del offspring[i].fitness.values
+
             # evaluation
-            pop = self.toolbox.evaluate(pop)
-            
-            batch_max_diversity = np.max([ind.diversity_score for ind in pop])
-            for ind in pop:
-                self.toolbox.update_corpus(ind)
-                
-                # update best safety and diversity
-                if ind.safety_score < self.best_safety:
-                    self.best_safety = ind.safety_score
-                if ind.diversity_score > self.best_diversity:
-                    self.best_diversity = ind.diversity_score
-            
-            # TODO: can update with more info
+            uneval_ind = [ind for ind in offspring if not ind.fitness.valid]
+            if uneval_ind:
+                uneval_ind = self.evaluate(uneval_ind)
+
+            # update population
+            self.pop[:] = offspring
+
+            # ========== Metrics ==========
+            best = tools.selBest(self.pop, 1)[0]
+            logger.info(f"Best individual: {best.id} with fitness {best.fitness.values}")
+            best_val = best.fitness.values[0]
+            self.best_score = min(self.best_score, best_val)
+
             self.logbook.record(
                 gen=self.generation_step,
-                safety=self.best_safety,
-                diversity=batch_max_diversity
+                fitness=best_val,
+                best_so_far=self.best_score
             )
-            
+
+            logger.info(
+                f"[Gen {self.generation_step}] "
+                f"Best of generation = {best_val:.4f}, "
+                f"Best so far = {self.best_score:.4f}"
+            )
+
             self.save_checkpoint()
-            
